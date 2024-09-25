@@ -105,7 +105,17 @@
   (begin
     (asserts! (is-eq tx-sender sender) ERR_NOT_AUTHORIZED)
     (asserts! (is-some (nft-get-owner? subscription-nft token-id)) ERR_NOT_FOUND)
-    (nft-transfer? subscription-nft token-id sender recipient)
+    (asserts! (not (is-eq recipient sender)) ERR_INVALID_INPUT)
+    (try! (nft-transfer? subscription-nft token-id sender recipient))
+    (let
+      (
+        (subscription (unwrap! (map-get? subscriptions token-id) ERR_NOT_FOUND))
+      )
+      (map-set subscriptions token-id
+        (merge subscription { owner: recipient })
+      )
+      (ok true)
+    )
   )
 )
 
