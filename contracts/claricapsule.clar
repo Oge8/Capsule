@@ -1,91 +1,132 @@
-;; Decentralized Time Capsule Network
+;; NFT-based Subscription Service (Improved)
 
 ;; Constants
-(define-constant contract-owner tx-sender)
-(define-constant err-owner-only (err u100))
-(define-constant err-already-exists (err u101))
-(define-constant err-does-not-exist (err u102))
-(define-constant err-not-authorized (err u103))
-(define-constant err-capsule-locked (err u104))
-(define-constant err-capsule-not-mature (err u105))
+(define-constant CONTRACT_OWNER tx-sender)
+(define-constant ERR_NOT_AUTHORIZED (err u100))
+(define-constant ERR_NOT_FOUND (err u102))
+(define-constant ERR_INVALID_INPUT (err u103))
 
 ;; Data Variables
-(define-data-var next-capsule-id uint u0)
+(define-data-var last-token-id uint u0)
 
-;; Maps
-(define-map time-capsules
-  { capsule-id: uint }
+;; Data Maps
+(define-map subscriptions
+  uint
   {
     owner: principal,
-    content: (string-ascii 256),
-    lock-height: uint,
-    is-revealed: bool
+    service-id: uint,
+    end-block: uint
   }
 )
 
-;; Private Functions
-(define-private (is-contract-owner)
-  (is-eq tx-sender contract-owner)
+(define-map services
+  uint
+  {
+    name: (string-ascii 50),
+    price: uint,
+    duration: uint
+  }
 )
 
-(define-private (capsule-exists (capsule-id uint))
-  (default-to false (get is-revealed (map-get? time-capsules { capsule-id: capsule-id })))
+;; NFT Definition
+(define-non-fungible-token subscription-nft uint)
+
+;; Private Functions
+(define-private (is-contract-owner)
+  (is-eq tx-sender CONTRACT_OWNER)
+)
+
+(define-private (validate-service-input (name (string-ascii 50)) (price uint) (duration uint))
+  (and
+    (> (len name) u0)
+    (< (len name) u51)
+    (> price u0)
+    (> duration u0)
+  )
+)
+
+(define-private (validate-subscription-input (service-id uint))
+  (is-some (map-get? services service-id))
 )
 
 ;; Public Functions
-(define-public (create-time-capsule (content (string-ascii 256)) (lock-duration uint))
+;; Create a new service
+(define-public (create-service (name (string-ascii 50)) (price uint) (duration uint))
   (let
     (
-      (new-capsule-id (var-get next-capsule-id))
-      (lock-height (+ block-height lock-duration))
+      (service-id (+ (var-get last-token-id) u1))
     )
-    (asserts! (is-some (string-ascii? content)) (err u106))
-    (map-set time-capsules
-      { capsule-id: new-capsule-id }
-      {
-        owner: tx-sender,
-        content: content,
-        lock-height: lock-height,
-        is-revealed: false
-      }
-    )
-    (var-set next-capsule-id (+ new-capsule-id u1))
-    (ok new-capsule-id)
+    (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-service-input name price duration) ERR_INVALID_INPUT)
+    (map-set services service-id {
+      name: name,
+      price: price,
+      duration: duration
+    })
+    (var-set last-token-id service-id)
+    (ok service-id)
   )
 )
 
-(define-public (reveal-capsule (capsule-id uint))
+;; Purchase a subscription
+(define-public (purchase-subscription (service-id uint))
   (let
     (
-      (capsule (unwrap! (map-get? time-capsules { capsule-id: capsule-id }) err-does-not-exist))
-      (owner (get owner capsule))
-      (lock-height (get lock-height capsule))
-      (is-revealed (get is-revealed capsule))
+      (service (unwrap! (map-get? services service-id) ERR_NOT_FOUND))
+      (subscription-id (+ (var-get last-token-id) u1))
+      (end-block (+ block-height (get duration service)))
+      (buyer tx-sender)
     )
-    (asserts! (is-eq tx-sender owner) err-not-authorized)
-    (asserts! (not is-revealed) err-capsule-locked)
-    (asserts! (>= block-height lock-height) err-capsule-not-mature)
-    (map-set time-capsules
-      { capsule-id: capsule-id }
-      (merge capsule { is-revealed: true })
-    )
-    (ok true)
+    (asserts! (validate-subscription-input service-id) ERR_INVALID_INPUT)
+    (try! (stx-transfer? (get price service) buyer (as-contract tx-sender)))
+    (try! (nft-mint? subscription-nft subscription-id buyer))
+    (map-set subscriptions subscription-id {
+      owner: buyer,
+      service-id: service-id,
+      end-block: end-block
+    })
+    (var-set last-token-id subscription-id)
+    (ok subscription-id)
   )
 )
 
-(define-read-only (get-capsule (capsule-id uint))
-  (let
-    (
-      (capsule (unwrap! (map-get? time-capsules { capsule-id: capsule-id }) err-does-not-exist))
-      (is-revealed (get is-revealed capsule))
-    )
-    (if is-revealed
-      (ok capsule)
-      (err err-capsule-locked)
+;; Get subscription details
+(define-read-only (get-subscription-details (subscription-id uint))
+  (map-get? subscriptions subscription-id)
+)
+
+;; Get service details
+(define-read-only (get-service-details (service-id uint))
+  (map-get? services service-id)
+)
+
+;; NFT functions
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-some (nft-get-owner? subscription-nft token-id)) ERR_NOT_FOUND)
+    (asserts! (not (is-eq recipient sender)) ERR_INVALID_INPUT)
+    (try! (nft-transfer? subscription-nft token-id sender recipient))
+    (let
+      (
+        (subscription (unwrap! (map-get? subscriptions token-id) ERR_NOT_FOUND))
+      )
+      (map-set subscriptions token-id
+        (merge subscription { owner: recipient })
+      )
+      (ok true)
     )
   )
 )
 
-(define-read-only (get-capsule-count)
-  (ok (var-get next-capsule-id))
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? subscription-nft token-id))
+)
+
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id))
+)
+
+(define-read-only (get-token-uri (token-id uint))
+  (ok (some u"https://example.com/subscription-nft"))
 )
